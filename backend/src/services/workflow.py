@@ -6,8 +6,8 @@ from sqlalchemy import and_, or_, select
 
 from src.config.settings import cache, engine
 from src.constants.workflow import Status
-from src.models.tables import audit, cases, evidence, runs
-from src.services import domain
+from src.models.tables import audit, case_voids, cases, evidence, orders, runs
+from src.services import domain, stock
 from src.utils.encoding import canonical
 from src.utils.time import utc_time
 
@@ -37,18 +37,56 @@ def make_case(title, payload, actor):
             raise ValueError('业务输入超过 512 KiB')
         if callable(getattr(domain, 'validate', None)):
             domain.validate(payload)
+        declared = domain.stock_declaration(payload)
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc)) from None
     with engine.begin() as conn:
         case_id = conn.execute(cases.insert().values(slug=uuid.uuid4().hex, title=title, payload=payload,
                                author=actor, created_at=utc_time())).inserted_primary_key[0]
+        stock.register_declaration(conn, declared)
         log(conn, actor, 'create_case', case_id)
         return found(conn, cases, case_id)
+
+
+def list_cases():
+    with engine.connect() as conn:
+        rows = [dict(row) for row in conn.execute(
+            select(cases).order_by(cases.c.id.desc()).limit(100)).mappings()]
+        voided = {dict(row)['case_id']: dict(row)['created_at']
+                  for row in conn.execute(select(case_voids)).mappings()}
+    for row in rows:
+        row['voided_at'] = voided.get(row['id'])
+    return rows
+
+
+def void_case(case_id, actor):
+    with engine.begin() as conn:
+        found(conn, cases, case_id)
+        stock.lock_case(conn, case_id)
+        if stock.is_void(conn, case_id):
+            raise HTTPException(409, '该批次已作废')
+        stock.void(conn, case_id, actor)
+        log(conn, actor, 'void', case_id)
+        row = found(conn, cases, case_id)
+        row['voided_at'] = conn.execute(select(case_voids.c.created_at)
+                                        .where(case_voids.c.case_id == case_id)).scalar_one()
+        return row
+
+
+def order_for(case_id):
+    with engine.connect() as conn:
+        found(conn, cases, case_id)
+        row = conn.execute(select(orders).where(orders.c.case_id == case_id)).mappings().first()
+    if row is None:
+        raise HTTPException(404, '该批次尚未出单')
+    return dict(row)
 
 
 def enqueue(case_id, actor):
     with engine.begin() as conn:
         found(conn, cases, case_id)
+        if stock.is_void(conn, case_id):
+            raise HTTPException(409, '该批次已作废，无法提交执行。')
         run_id = conn.execute(runs.insert().values(case_id=case_id, status=Status.QUEUED,
                               owner=actor, created_at=utc_time())).inserted_primary_key[0]
         log(conn, actor, 'enqueue', run_id)
@@ -73,7 +111,7 @@ def claim():
         token = str(uuid.uuid4())
         conn.execute(runs.update().where(runs.c.id == run.id).values(
             started_at=utc_time(), status=Status.RUNNING, attempt_token=token))
-        return run.id, token, found(conn, cases, run.case_id)['payload']
+        return run.id, token, run.case_id, found(conn, cases, run.case_id)['payload']
 
 
 def finish(run_id, token, result=None, error=None):

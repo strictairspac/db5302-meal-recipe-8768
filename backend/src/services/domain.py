@@ -3,7 +3,10 @@
 import json
 import re
 from collections import Counter
-from decimal import Decimal, InvalidOperation, localcontext
+from decimal import Decimal, InvalidOperation
+
+from src.services import stock
+from src.utils.quantity import packages, shortage, text_of
 
 from .recipe_sql import EXPAND_RECIPES
 
@@ -15,7 +18,7 @@ CODE = re.compile(r"[A-Za-z0-9_-]{1,32}")
 
 SPEC = {
     "name": "砚街食堂·团餐备料展开",
-    "summary": "从午餐菜单展开半成品配方，合并原料需求并按库存和包装规格生成采购备料单。",
+    "summary": "从菜单批次展开半成品配方，多批同仓占料，按本批实际占用和包装规格生成采购备料单并出单。",
     "customer": "砚街食堂团餐中心·生产计划组",
     "entity_labels": ["菜单批次", "原料展算", "采购备料单"],
     "field_labels": {
@@ -36,7 +39,7 @@ SPEC = {
         "component": "下级配方或原料编号",
         "qty": "每单位上级产出耗用量",
     },
-    "guidance": "填写菜单份数、单位产出耗用量和本批可用库存。先处理冻结菜品，再按已通过菜品的备料单核对采购包数。",
+    "guidance": "填写菜单份数、单位产出耗用量和本批可用库存。多批各自填报、同仓占料，缺口按本批实际占用计算；先处理冻结菜品，再按已通过菜品的备料单核对采购包数。",
     "sample": {
         "batch": "砚街食堂 11月21日午餐",
         "menu": [
@@ -190,7 +193,7 @@ def _prepare(payload):
             raise ValueError(f"配方 {parent} 内的用料 {child} 重复，请合并耗用量。")
         pairs.add((parent, child))
         ratio = _decimal(row.get("qty"), f"{parent} → {child} 耗用量", 100)
-        edges.append({"parent_id": nodes[parent]["id"], "child_id": nodes[child]["id"], "ratio": _quantity(ratio)})
+        edges.append({"parent_id": nodes[parent]["id"], "child_id": nodes[child]["id"], "ratio": text_of(ratio)})
 
     return batch, menu_input, nodes, edges, len(recipes)
 
@@ -199,35 +202,59 @@ def validate(payload):
     _prepare(payload)
 
 
-def _quantity(number):
-    fixed = format(number, "f")
-    return fixed.rstrip("0").rstrip(".") if "." in fixed else fixed
+def stock_declaration(payload):
+    """The batch's own stock fill: {ingredient code: declared quantity}."""
+    _, _, nodes, _, _ = _prepare(payload)
+    return {node["code"]: node["stock"] for node in nodes.values() if "stock" in node}
 
 
 def _label(node):
     return f"{node['name']}（{node['code']}）"
 
 
-def _purchase_row(node, row):
+def _purchase_row(node, row, occupied):
     gross = row["quantity"]
-    stock, pack = node["stock"], node["pack"]
-    with localcontext() as context:
-        context.prec = 60
-        shortage = max(gross - stock, Decimal(0))
-        packages, remainder = divmod(shortage, pack)
-        packages = int(packages) + int(remainder > 0)
-        order_quantity = packages * pack
+    pack = node["pack"]
+    gap = shortage(gross, occupied)
+    count, order_quantity = packages(gap, pack)
     return {
         "原料编号": node["code"], "原料": node["name"], "单位": node["unit"],
-        "需求量": _quantity(gross), "可用库存": _quantity(stock), "缺口": _quantity(shortage),
-        "每包数量": _quantity(pack), "建议包数": str(packages), "建议采购量": _quantity(order_quantity),
+        "需求量": text_of(gross), "申报库存": text_of(node["stock"]),
+        "实际占用": text_of(occupied), "缺口": text_of(gap),
+        "每包数量": text_of(pack), "建议包数": str(count), "建议采购量": text_of(order_quantity),
         "来源菜单行数": row["menu_count"], "计入路径数": row["path_count"],
-        "采购判定": "按包补货" if packages else "库存够用",
+        "采购判定": "按包补货" if count else "库存够用",
     }
 
 
-def solve(payload, engine):
+def _occupy(engine, case_id, by_id, totals):
+    """Occupy demanded ingredients one transaction each, sorted by code.
+
+    Per-ingredient transactions keep lock scope small: batches never block
+    each other as a whole, and an interrupted run simply retries — already
+    occupied rows are reused, never doubled.
+    """
+    occupied, snapshot = {}, []
+    for node_id in sorted(totals, key=lambda identity: by_id[identity]["code"]):
+        node = by_id[node_id]
+        with engine.begin() as conn:
+            quantity, info = stock.occupy(conn, case_id, node["code"],
+                                          node["stock"], totals[node_id]["quantity"])
+        occupied[node["code"]] = quantity
+        snapshot.append({
+            "原料编号": node["code"], "原料": node["name"], "单位": node["unit"],
+            "仓库现存": text_of(info["on_hand"]), "本批占用": text_of(quantity),
+            "他批占用": text_of(info["others"]), "占用后剩余": text_of(info["left"]),
+        })
+    return occupied, snapshot
+
+
+def solve(payload, engine, case_id):
     batch, menu, nodes, edges, recipe_count = _prepare(payload)
+    with engine.begin() as conn:
+        stock.lock_case(conn, case_id)
+        if stock.is_void(conn, case_id):
+            raise ValueError("该菜单批次已作废，无法备料。")
     with engine.begin() as conn:
         rows = conn.execute(EXPAND_RECIPES, {
             "menu": json.dumps(menu),
@@ -252,14 +279,14 @@ def solve(payload, engine):
         }
         for line_id, item in enumerate(menu, start=1)
     ]
-    purchase, evidence, issues = [], [], []
+    totals, evidence, issues = {}, [], []
     for row in rows:
         kind = row["kind"]
         if kind == "budget":
             continue
         node = by_id[row["node_id"]]
         if kind == "total":
-            purchase.append(_purchase_row(node, row))
+            totals[row["node_id"]] = row
             continue
         path_ids = [int(value) for value in row["path_ids"].split(",")]
         path = [_label(by_id[node_id]) for node_id in path_ids]
@@ -270,7 +297,7 @@ def solve(payload, engine):
             evidence.append({
                 "菜单行": item["line"], "原料编号": node["code"], "单位": node["unit"],
                 "配方路径": " → ".join(path), "路径算式": " × ".join(factors),
-                "路径用量": _quantity(row["quantity"]),
+                "路径用量": text_of(row["quantity"]),
                 "采购口径": "冻结，未计入" if row["line_id"] in blocked else "已计入",
             })
         else:
@@ -281,15 +308,26 @@ def solve(payload, engine):
                 "处理动作": action,
             })
 
+    occupied, warehouse_rows = _occupy(engine, case_id, by_id, totals)
+    purchase = [_purchase_row(by_id[node_id], row, occupied[by_id[node_id]["code"]])
+                for node_id, row in totals.items()]
     purchase.sort(key=lambda item: item["原料编号"])
+    order_id = None
+    if purchase:
+        with engine.begin() as conn:
+            order_id, _, stored, fresh = stock.issue(conn, case_id, purchase)
+        if not fresh:
+            purchase = stored
+
     approved = len(menu) - len(blocked)
     to_order = sum(row["采购判定"] == "按包补货" for row in purchase)
     purchase_summary = (
         f"已核菜品有 {to_order} 种原料需要补货。" if approved else "请修正配方后重算采购量。"
     )
+    order_summary = f"采购单 #{order_id} 已出单。" if order_id else ""
     return {
         "summary": f"{batch}共 {len(menu)} 条菜单行，核准 {approved} 条，冻结 {len(blocked)} 条。"
-                   f"{purchase_summary}",
+                   f"{purchase_summary}{order_summary}",
         "metrics": {
             "已核菜单行": approved,
             "冻结菜单行": len(blocked),
@@ -301,5 +339,6 @@ def solve(payload, engine):
             {"title": "菜单行核算状态", "rows": menu_rows},
             {"title": "待修配方", "rows": issues},
             {"title": "原料用量路径", "rows": evidence},
+            {"title": "仓库占用（出单时）", "rows": warehouse_rows},
         ],
     }
